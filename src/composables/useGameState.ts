@@ -155,13 +155,57 @@ const updateGame = (deltaMs: number) => {
     updateBird(bird, deltaMs, weatherEffect)
   })
 
+  validateExpeditionIntegrity()
   cleanupExpiredBerries()
   checkGameEnd()
   saveGame(state)
 }
 
+const validateExpeditionIntegrity = () => {
+  state.birds.forEach(bird => {
+    if (!bird.expedition) return
+
+    if (bird.expedition.status !== 'idle') {
+      if (bird.isDead) {
+        completeExpedition(bird, true)
+        return
+      }
+
+      if (bird.expedition.returnTime && Date.now() > bird.expedition.returnTime + 60000) {
+        addEventLog(
+          `⚠️ 检测到 ${bird.name} 的探险状态异常，已自动结算`,
+          'warning'
+        )
+        completeExpedition(bird, true)
+        return
+      }
+
+      if (bird.expedition.status === 'exploring' && bird.health <= DEATH_THRESHOLD) {
+        completeExpedition(bird, true)
+        killBird(bird)
+        return
+      }
+    }
+
+    if ((bird.expedition as any)._record || (bird.expedition as any)._pendingEvents) {
+      if (bird.expedition.status === 'idle') {
+        delete (bird.expedition as any)._record
+        delete (bird.expedition as any)._pendingEvents
+        delete (bird.expedition as any)._triggeredCount
+        delete (bird.expedition as any)._criticalReturnLogged
+        delete (bird.expedition as any)._skippedEvents
+      }
+    }
+  })
+}
+
 const updateBird = (bird: Bird, deltaMs: number, weatherEffect: ReturnType<typeof getWeatherEffects>) => {
-  if (bird.isDead) return
+  if (bird.isDead) {
+    if (bird.expedition && bird.expedition.status !== 'idle') {
+      completeExpedition(bird, true)
+    }
+    return
+  }
 
   if (bird.isAway && bird.awayUntil && Date.now() >= bird.awayUntil) {
     bird.isAway = false
@@ -182,6 +226,11 @@ const updateBird = (bird: Bird, deltaMs: number, weatherEffect: ReturnType<typeo
 
   if (bird.expedition && bird.expedition.status !== 'idle') {
     updateExpedition(bird, deltaMs)
+
+    if (bird.health <= DEATH_THRESHOLD && (bird.expedition as any).status !== 'idle') {
+      completeExpedition(bird, true)
+      killBird(bird)
+    }
     return
   }
 
@@ -280,6 +329,10 @@ const growBird = (bird: Bird) => {
 }
 
 const killBird = (bird: Bird) => {
+  if (bird.expedition && bird.expedition.status !== 'idle') {
+    completeExpedition(bird, true)
+  }
+
   bird.isDead = true
   state.totalDied++
   addEventLog(`💔 ${bird.name} 离开了我们...`, 'danger')
@@ -562,7 +615,7 @@ const startExpedition = (birdId: string, area: ExpeditionArea): boolean => {
   }
 
   const events = generateExpeditionEvents(area, state.currentWeather, bird.personality)
-  bird.expedition._pendingEvents = events as any
+  ;(bird.expedition as any)._pendingEvents = events
 
   addEventLog(`🗺️ ${bird.name} 出发前往${areaConfig.emoji}${areaConfig.name}探险了！预计${Math.ceil(duration / 1000)}秒后返回`, 'info')
   return true
@@ -576,9 +629,30 @@ const updateExpedition = (bird: Bird, deltaMs: number) => {
   const elapsed = now - exp.startTime
   exp.progress = clamp(elapsed / exp.duration, 0, 1)
 
+  const CRITICAL_HEALTH_THRESHOLD = 20
+
+  if (bird.health <= CRITICAL_HEALTH_THRESHOLD && bird.health > DEATH_THRESHOLD && exp.status === 'exploring') {
+    if (!(exp as any)._criticalReturnLogged) {
+      addEventLog(
+        `🆘 ${bird.name} 伤势过重（健康${Math.round(bird.health)}），紧急中止探险返回！`,
+        'warning'
+      )
+      ;(exp as any)._criticalReturnLogged = true
+    }
+
+    const remainingEvents = (exp as any)._pendingEvents?.length || 0
+    if (remainingEvents > 0) {
+      const skipped = (exp as any)._pendingEvents.splice(0)
+      ;(exp as any)._skippedEvents = skipped
+    }
+
+    completeExpedition(bird, true)
+    return
+  }
+
   const pendingEvents = (exp as any)._pendingEvents as ExpeditionEvent[] | undefined
   if (pendingEvents && pendingEvents.length > 0) {
-    const totalEvents = pendingEvents.length
+    const totalEvents = pendingEvents.length + ((exp as any)._triggeredCount || 0)
     const triggeredIdx = Math.floor(exp.progress * totalEvents) - ((exp as any)._triggeredCount || 0)
 
     for (let i = 0; i < triggeredIdx; i++) {
@@ -586,6 +660,10 @@ const updateExpedition = (bird: Bird, deltaMs: number) => {
       const event = pendingEvents.shift()!
       resolveExpeditionEvent(bird, event)
       ;(exp as any)._triggeredCount = ((exp as any)._triggeredCount || 0) + 1
+
+      if (bird.health <= CRITICAL_HEALTH_THRESHOLD) {
+        break
+      }
     }
   }
 
@@ -656,15 +734,17 @@ const resolveExpeditionEvent = (bird: Bird, event: ExpeditionEvent) => {
 
   if (bird.health <= DEATH_THRESHOLD) {
     addEventLog(`💔 ${bird.name} 在探险中遭遇不测...`, 'danger')
+    completeExpedition(bird, true)
     killBird(bird)
   }
 }
 
-const completeExpedition = (bird: Bird) => {
+const completeExpedition = (bird: Bird, isForced: boolean = false) => {
   if (!bird.expedition) return
 
   const exp = bird.expedition
-  exp.status = 'returning'
+  const wasExploring = exp.status === 'exploring'
+  exp.status = isForced ? 'idle' : 'returning'
 
   const interim = (exp as any)._record || {
     events: [],
@@ -675,7 +755,12 @@ const completeExpedition = (bird: Bird) => {
     healthDelta: 0,
   }
 
-  const success = bird.health > DEATH_THRESHOLD
+  const pendingEvents = (exp as any)._pendingEvents as ExpeditionEvent[] | undefined
+  const remainingEvents = pendingEvents?.length || 0
+  const totalPlannedEvents = interim.events.length + remainingEvents
+
+  const finalHealthDelta = interim.healthDelta
+  const success = bird.health > DEATH_THRESHOLD && !isForced
 
   const record: ExpeditionRecord = {
     id: generateId(),
@@ -684,32 +769,52 @@ const completeExpedition = (bird: Bird) => {
     area: exp.area,
     startTime: exp.startTime,
     endTime: Date.now(),
-    duration: exp.duration,
-    events: interim.events,
+    duration: Date.now() - exp.startTime,
+    events: [...interim.events],
     totalFoodGained: interim.totalFoodGained,
-    totalCluesFound: interim.totalCluesFound,
+    totalCluesFound: [...interim.totalCluesFound],
     hungerDelta: interim.hungerDelta,
     fearDelta: interim.fearDelta,
-    healthDelta: interim.healthDelta,
+    healthDelta: finalHealthDelta,
     success,
   }
 
   state.expeditionRecords.unshift(record)
+  if (!exp.history) exp.history = []
   exp.history.unshift(record)
   if (exp.history.length > 10) exp.history.pop()
 
   const areaConfig = EXPEDITION_AREAS[exp.area]
+
+  if (isForced) {
+    const reason = !success ? '不幸遇难' : '紧急返回'
+    addEventLog(
+      `⚠️ ${bird.name} 在${areaConfig.emoji}${areaConfig.name}${reason}！已触发紧急结算`,
+      'danger'
+    )
+
+    if (remainingEvents > 0) {
+      addEventLog(
+        `📊 探险进度 ${Math.round(exp.progress * 100)}%，已完成 ${interim.events.length}/${totalPlannedEvents} 个事件`,
+        'info'
+      )
+    }
+  }
+
   const summaryParts = [
     `共${record.events.length}件事`,
     `带回食物${record.totalFoodGained}🍒`,
   ]
   if (record.totalCluesFound.length > 0) summaryParts.push(`线索×${record.totalCluesFound.length}📜`)
   if (record.healthDelta !== 0) summaryParts.push(`健康${record.healthDelta > 0 ? '+' : ''}${record.healthDelta}`)
+  if (isForced) summaryParts.push(`⚠️ ${success ? '提前返回' : '遇险终止'}`)
 
-  addEventLog(
-    `🏠 ${bird.name} 从${areaConfig.emoji}${areaConfig.name}归来！${summaryParts.join('｜')}`,
-    success ? 'success' : 'warning'
-  )
+  if (wasExploring || isForced) {
+    addEventLog(
+      `🏠 ${bird.name} 从${areaConfig.emoji}${areaConfig.name}归来！${summaryParts.join('｜')}`,
+      success ? 'success' : 'danger'
+    )
+  }
 
   bird.expedition = {
     status: 'idle',
@@ -720,6 +825,10 @@ const completeExpedition = (bird: Bird) => {
     progress: 0,
     history: exp.history,
   }
+
+  delete (bird.expedition as any)._record
+  delete (bird.expedition as any)._pendingEvents
+  delete (bird.expedition as any)._triggeredCount
 }
 
 const tryLoadGame = (): boolean => {
