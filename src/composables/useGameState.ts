@@ -1,5 +1,5 @@
 import { reactive, computed, watch } from 'vue'
-import type { GameState, Bird, Berry, GrowthStage, Personality, BerryType, Weather, GameScore } from '@/types/game'
+import type { GameState, Bird, Berry, GrowthStage, Personality, BerryType, Weather, GameScore, ExpeditionArea, ExpeditionEvent, ExpeditionRecord } from '@/types/game'
 import {
   ATTR_MIN, ATTR_MAX, DEATH_THRESHOLD,
   STAGE_DURATION, FOOD_NEED_MULTIPLIER,
@@ -8,8 +8,11 @@ import {
   BERRY_VALUES, WEATHER_CHANGE_INTERVAL, WEATHER_EFFECTS,
   DAY_DURATION, INITIAL_FOOD, MIN_EGGS, MAX_EGGS,
   MAX_BREEDING_ROUNDS, BIRD_NAMES,
+  EXPEDITION_AREAS, EXPEDITION_MIN_HUNGER, EXPEDITION_MIN_HEALTH,
+  EXPEDITION_EVENT_COUNT_MIN, EXPEDITION_EVENT_COUNT_MAX,
+  getExpeditionEventPool,
 } from '@/utils/constants'
-import { randomInt, randomFloat, clamp, randomChoice, generateId, chance } from '@/utils/random'
+import { randomInt, randomFloat, clamp, randomChoice, generateId, chance, weightedChoice } from '@/utils/random'
 import { saveGame, loadGame, clearSave } from '@/utils/storage'
 
 const createInitialState = (): GameState => ({
@@ -26,6 +29,8 @@ const createInitialState = (): GameState => ({
   breedingCount: 0,
   maxBreedingRounds: MAX_BREEDING_ROUNDS,
   eventLog: [],
+  expeditionRecords: [],
+  collectedClues: [],
 })
 
 const state = reactive<GameState>(createInitialState())
@@ -172,6 +177,11 @@ const updateBird = (bird: Bird, deltaMs: number, weatherEffect: ReturnType<typeo
     if (bird.hatchTimeLeft <= 0) {
       hatchBird(bird)
     }
+    return
+  }
+
+  if (bird.expedition && bird.expedition.status !== 'idle') {
+    updateExpedition(bird, deltaMs)
     return
   }
 
@@ -471,6 +481,247 @@ const returnToStart = () => {
   clearSave()
 }
 
+const generateExpeditionEvents = (
+  area: ExpeditionArea,
+  weather: Weather,
+  personality: Personality,
+): ExpeditionEvent[] => {
+  const pool = getExpeditionEventPool(area, weather, personality)
+  const count = randomInt(EXPEDITION_EVENT_COUNT_MIN, EXPEDITION_EVENT_COUNT_MAX)
+  const events: ExpeditionEvent[] = []
+  const used = new Set<string>()
+
+  for (let i = 0; i < count; i++) {
+    const available = pool.filter(e => !used.has(e.title))
+    if (available.length === 0) break
+    const chosen = weightedChoice(available)
+    const event: ExpeditionEvent = {
+      id: generateId(),
+      ...chosen,
+    }
+    events.push(event)
+    used.add(event.title)
+  }
+
+  return events
+}
+
+const canStartExpedition = (birdId: string): { ok: boolean; reason?: string } => {
+  const bird = state.birds.find(b => b.id === birdId)
+  if (!bird) return { ok: false, reason: '小鸟不存在' }
+  if (bird.isDead) return { ok: false, reason: '已离世，无法探险' }
+  if (bird.isSick) return { ok: false, reason: '生病了，先休息吧' }
+  if (bird.expedition?.status === 'exploring' || bird.expedition?.status === 'returning') {
+    return { ok: false, reason: '正在探险中...' }
+  }
+  if (bird.stage !== 'subadult' && bird.stage !== 'adult') {
+    return { ok: false, reason: '只有亚成鸟和成鸟可以探险' }
+  }
+  if (bird.hunger < EXPEDITION_MIN_HUNGER) {
+    return { ok: false, reason: `饱食度过低（需≥${EXPEDITION_MIN_HUNGER}），先喂食吧` }
+  }
+  if (bird.health < EXPEDITION_MIN_HEALTH) {
+    return { ok: false, reason: `健康度过低（需≥${EXPEDITION_MIN_HEALTH}），先休养吧` }
+  }
+  if (bird.isAway) {
+    return { ok: false, reason: '暂时离巢了，等它回来吧' }
+  }
+  if (state.currentWeather === 'stormy') {
+    return { ok: false, reason: '暴风天气太危险了，改天吧' }
+  }
+  return { ok: true }
+}
+
+const startExpedition = (birdId: string, area: ExpeditionArea): boolean => {
+  const check = canStartExpedition(birdId)
+  if (!check.ok) {
+    addEventLog(`❌ ${check.reason}`, 'warning')
+    return false
+  }
+
+  const bird = state.birds.find(b => b.id === birdId)!
+  const areaConfig = EXPEDITION_AREAS[area]
+
+  const weatherMod = areaConfig.weatherMod[state.currentWeather]
+  const personalityMod =
+    bird.personality === 'bold' ? 0.9 :
+    bird.personality === 'curious' ? 0.95 :
+    bird.personality === 'shy' ? 1.15 :
+    bird.personality === 'stubborn' ? 1.1 : 1.0
+
+  const duration = Math.round(areaConfig.baseDuration * weatherMod * personalityMod)
+
+  bird.expedition = {
+    status: 'exploring',
+    area,
+    startTime: Date.now(),
+    duration,
+    returnTime: Date.now() + duration,
+    progress: 0,
+    history: bird.expedition?.history || [],
+  }
+
+  const events = generateExpeditionEvents(area, state.currentWeather, bird.personality)
+  bird.expedition._pendingEvents = events as any
+
+  addEventLog(`🗺️ ${bird.name} 出发前往${areaConfig.emoji}${areaConfig.name}探险了！预计${Math.ceil(duration / 1000)}秒后返回`, 'info')
+  return true
+}
+
+const updateExpedition = (bird: Bird, deltaMs: number) => {
+  if (!bird.expedition || bird.expedition.status === 'idle') return
+
+  const exp = bird.expedition
+  const now = Date.now()
+  const elapsed = now - exp.startTime
+  exp.progress = clamp(elapsed / exp.duration, 0, 1)
+
+  const pendingEvents = (exp as any)._pendingEvents as ExpeditionEvent[] | undefined
+  if (pendingEvents && pendingEvents.length > 0) {
+    const totalEvents = pendingEvents.length
+    const triggeredIdx = Math.floor(exp.progress * totalEvents) - ((exp as any)._triggeredCount || 0)
+
+    for (let i = 0; i < triggeredIdx; i++) {
+      if (pendingEvents.length === 0) break
+      const event = pendingEvents.shift()!
+      resolveExpeditionEvent(bird, event)
+      ;(exp as any)._triggeredCount = ((exp as any)._triggeredCount || 0) + 1
+    }
+  }
+
+  if (now >= exp.returnTime && exp.status === 'exploring') {
+    completeExpedition(bird)
+  }
+}
+
+const resolveExpeditionEvent = (bird: Bird, event: ExpeditionEvent) => {
+  if (!bird.expedition) return
+
+  const areaConfig = EXPEDITION_AREAS[bird.expedition.area]
+
+  const hungerDelta = Math.round(event.hungerDelta * areaConfig.rewardMultiplier)
+  const fearDelta = Math.round(event.fearDelta)
+  const healthDelta = Math.round(event.healthDelta * (event.healthDelta < 0 ? 1 : areaConfig.rewardMultiplier))
+  const foodReward = Math.round(event.foodReward * areaConfig.rewardMultiplier)
+
+  bird.hunger = clamp(bird.hunger + hungerDelta, ATTR_MIN, ATTR_MAX)
+  bird.fear = clamp(bird.fear + fearDelta, ATTR_MIN, ATTR_MAX)
+  bird.health = clamp(bird.health + healthDelta, ATTR_MIN, ATTR_MAX)
+  state.foodStock += foodReward
+
+  if (event.clueReward && !state.collectedClues.includes(event.clueReward)) {
+    state.collectedClues.push(event.clueReward)
+  }
+
+  bird.expedition.currentEvent = event
+  setTimeout(() => {
+    if (bird.expedition?.currentEvent?.id === event.id) {
+      bird.expedition.currentEvent = undefined
+    }
+  }, 3500)
+
+  const logParts: string[] = []
+  if (hungerDelta !== 0) logParts.push(`饱食${hungerDelta > 0 ? '+' : ''}${hungerDelta}`)
+  if (fearDelta !== 0) logParts.push(`恐惧${fearDelta > 0 ? '+' : ''}${fearDelta}`)
+  if (healthDelta !== 0) logParts.push(`健康${healthDelta > 0 ? '+' : ''}${healthDelta}`)
+  if (foodReward > 0) logParts.push(`食物+${foodReward}`)
+  if (event.clueReward) logParts.push('发现线索📜')
+
+  const logType =
+    event.type === 'danger' ? 'danger' :
+    event.type === 'clue' ? 'success' :
+    event.type === 'find' || event.type === 'encounter' ? 'success' :
+    'info'
+
+  addEventLog(
+    `${event.emoji} [${bird.name}] ${event.title}：${event.description}${logParts.length ? ' (' + logParts.join('，') + ')' : ''}`,
+    logType
+  )
+
+  const record = (bird.expedition as any)._record || {
+    events: [],
+    totalFoodGained: 0,
+    totalCluesFound: [],
+    hungerDelta: 0,
+    fearDelta: 0,
+    healthDelta: 0,
+  }
+  record.events.push(event)
+  record.totalFoodGained += foodReward
+  if (event.clueReward) record.totalCluesFound.push(event.clueReward)
+  record.hungerDelta += hungerDelta
+  record.fearDelta += fearDelta
+  record.healthDelta += healthDelta
+  ;(bird.expedition as any)._record = record
+
+  if (bird.health <= DEATH_THRESHOLD) {
+    addEventLog(`💔 ${bird.name} 在探险中遭遇不测...`, 'danger')
+    killBird(bird)
+  }
+}
+
+const completeExpedition = (bird: Bird) => {
+  if (!bird.expedition) return
+
+  const exp = bird.expedition
+  exp.status = 'returning'
+
+  const interim = (exp as any)._record || {
+    events: [],
+    totalFoodGained: 0,
+    totalCluesFound: [],
+    hungerDelta: 0,
+    fearDelta: 0,
+    healthDelta: 0,
+  }
+
+  const success = bird.health > DEATH_THRESHOLD
+
+  const record: ExpeditionRecord = {
+    id: generateId(),
+    birdId: bird.id,
+    birdName: bird.name,
+    area: exp.area,
+    startTime: exp.startTime,
+    endTime: Date.now(),
+    duration: exp.duration,
+    events: interim.events,
+    totalFoodGained: interim.totalFoodGained,
+    totalCluesFound: interim.totalCluesFound,
+    hungerDelta: interim.hungerDelta,
+    fearDelta: interim.fearDelta,
+    healthDelta: interim.healthDelta,
+    success,
+  }
+
+  state.expeditionRecords.unshift(record)
+  exp.history.unshift(record)
+  if (exp.history.length > 10) exp.history.pop()
+
+  const areaConfig = EXPEDITION_AREAS[exp.area]
+  const summaryParts = [
+    `共${record.events.length}件事`,
+    `带回食物${record.totalFoodGained}🍒`,
+  ]
+  if (record.totalCluesFound.length > 0) summaryParts.push(`线索×${record.totalCluesFound.length}📜`)
+  if (record.healthDelta !== 0) summaryParts.push(`健康${record.healthDelta > 0 ? '+' : ''}${record.healthDelta}`)
+
+  addEventLog(
+    `🏠 ${bird.name} 从${areaConfig.emoji}${areaConfig.name}归来！${summaryParts.join('｜')}`,
+    success ? 'success' : 'warning'
+  )
+
+  bird.expedition = {
+    status: 'idle',
+    area: exp.area,
+    startTime: 0,
+    duration: 0,
+    returnTime: 0,
+    progress: 0,
+    history: exp.history,
+  }
+}
+
 const tryLoadGame = (): boolean => {
   const saved = loadGame()
   if (saved && saved.phase === 'playing' || saved?.phase === 'breeding') {
@@ -506,5 +757,7 @@ export function useGameState() {
     tryLoadGame,
     allAdults,
     aliveCount,
+    startExpedition,
+    canStartExpedition,
   }
 }

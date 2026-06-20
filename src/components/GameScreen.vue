@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { watch, onMounted } from 'vue'
+import { watch, onMounted, ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { useGameState } from '@/composables/useGameState'
 import StatusBar from './StatusBar.vue'
@@ -7,13 +7,16 @@ import NestScene from './NestScene.vue'
 import WeatherOverlay from './WeatherOverlay.vue'
 import BirdCard from './BirdCard.vue'
 import EventModal from './EventModal.vue'
-import { WEATHER_COLORS } from '@/utils/constants'
+import ExpeditionRecords from './ExpeditionRecords.vue'
+import { WEATHER_COLORS, EXPEDITION_AREAS } from '@/utils/constants'
+import type { ExpeditionArea } from '@/types/game'
 
 const router = useRouter()
 const {
   state, allAdults, aliveCount,
   collectBerry, feedBird, calmBird, buryBird,
   releaseBirds, keepAndBreed, returnToStart, tryLoadGame,
+  startExpedition, canStartExpedition,
 } = useGameState()
 
 onMounted(() => {
@@ -43,6 +46,18 @@ const handleCollect = (id: string) => {
   if (val > 0) {
   }
 }
+
+const handleStartExpedition = (birdId: string, area: ExpeditionArea) => {
+  startExpedition(birdId, area)
+}
+
+const showRecords = ref(false)
+
+const totalExpeditions = computed(() => state.expeditionRecords.length)
+const totalClues = computed(() => state.collectedClues.length)
+const totalExpeditionFood = computed(() =>
+  state.expeditionRecords.reduce((sum, r) => sum + r.totalFoodGained, 0)
+)
 </script>
 
 <template>
@@ -59,9 +74,48 @@ const handleCollect = (id: string) => {
 
       <div class="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-12 gap-4">
         <div class="lg:col-span-3 order-2 lg:order-1 min-h-0 flex flex-col gap-3 overflow-y-auto scrollbar-hide">
-          <div class="font-display text-lg text-amber-300 flex items-center gap-2 px-1">
-            <span>🐦</span> 小鸟档案
+          <div class="flex items-center justify-between px-1">
+            <div class="font-display text-lg text-amber-300 flex items-center gap-2">
+              <span>🐦</span> 小鸟档案
+            </div>
+            <button
+              v-if="totalExpeditions > 0"
+              class="text-[10px] px-2 py-1 rounded-lg transition-all flex items-center gap-1"
+              :class="showRecords ? 'bg-cyan-500/30 text-cyan-200' : 'bg-white/10 text-white/70 hover:bg-white/20'"
+              @click="showRecords = !showRecords"
+            >
+              📜 探险记录
+              <span v-if="totalExpeditions > 0" class="bg-white/20 px-1.5 rounded-full">
+                {{ totalExpeditions }}
+              </span>
+            </button>
           </div>
+
+          <ExpeditionRecords
+            v-if="showRecords"
+            :records="state.expeditionRecords"
+            :clues="state.collectedClues"
+            :total-food="totalExpeditionFood"
+            @close="showRecords = false"
+          />
+
+          <div v-if="totalExpeditions > 0 && !showRecords" class="glass rounded-xl p-3 flex items-center justify-around text-xs">
+            <div class="text-center">
+              <div class="text-amber-300 font-bold">{{ totalExpeditions }}</div>
+              <div class="text-white/50 text-[10px]">探险次数</div>
+            </div>
+            <div class="w-px h-8 bg-white/10" />
+            <div class="text-center">
+              <div class="text-green-300 font-bold">+{{ totalExpeditionFood }}</div>
+              <div class="text-white/50 text-[10px]">累计食物</div>
+            </div>
+            <div class="w-px h-8 bg-white/10" />
+            <div class="text-center">
+              <div class="text-cyan-300 font-bold">{{ totalClues }}</div>
+              <div class="text-white/50 text-[10px]">收集线索</div>
+            </div>
+          </div>
+
           <div class="flex flex-col gap-3 pb-4">
             <BirdCard
               v-for="bird in state.birds"
@@ -69,10 +123,13 @@ const handleCollect = (id: string) => {
               :bird="bird"
               :selected="state.selectedBirdId === bird.id"
               :food-stock="state.foodStock"
+              :weather="state.currentWeather"
+              :can-expedition="canStartExpedition(bird.id)"
               @select="handleSelectBird(bird.id)"
               @feed="((amt: number) => feedBird(bird.id, amt))"
               @calm="calmBird(bird.id)"
               @bury="buryBird(bird.id)"
+              @start-expedition="(area) => handleStartExpedition(bird.id, area)"
             />
           </div>
         </div>

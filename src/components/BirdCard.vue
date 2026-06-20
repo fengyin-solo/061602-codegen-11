@@ -1,14 +1,17 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { Bird } from '@/types/game'
+import type { Bird, Weather, ExpeditionArea } from '@/types/game'
 import AttributeBar from './AttributeBar.vue'
 import BirdSprite from './BirdSprite.vue'
-import { STAGE_NAMES, PERSONALITY_NAMES, PERSONALITY_EMOJI } from '@/utils/constants'
+import ExpeditionPanel from './ExpeditionPanel.vue'
+import { STAGE_NAMES, PERSONALITY_NAMES, PERSONALITY_EMOJI, EXPEDITION_AREAS } from '@/utils/constants'
 
 const props = defineProps<{
   bird: Bird
   selected?: boolean
   foodStock: number
+  weather: Weather
+  canExpedition: { ok: boolean; reason?: string }
 }>()
 
 const emit = defineEmits<{
@@ -16,10 +19,16 @@ const emit = defineEmits<{
   (e: 'feed', amount: number): void
   (e: 'calm'): void
   (e: 'bury'): void
+  (e: 'startExpedition', area: ExpeditionArea): void
 }>()
 
 const canInteract = computed(() => {
   return !props.bird.isDead && !props.bird.isAway && props.bird.stage !== 'egg'
+    && !(props.bird.expedition?.status === 'exploring' || props.bird.expedition?.status === 'returning')
+})
+
+const isExploring = computed(() => {
+  return props.bird.expedition?.status === 'exploring' || props.bird.expedition?.status === 'returning'
 })
 
 const feedAmounts = [5, 10, 20]
@@ -29,6 +38,11 @@ const hatchProgress = computed(() => {
   const total = props.bird.hatchDuration
   const left = Math.max(0, props.bird.hatchTimeLeft)
   return ((total - left) / total) * 100
+})
+
+const exploringAreaName = computed(() => {
+  if (!isExploring.value || !props.bird.expedition) return ''
+  return EXPEDITION_AREAS[props.bird.expedition.area].name
 })
 </script>
 
@@ -40,6 +54,7 @@ const hatchProgress = computed(() => {
         ? 'glass ring-2 ring-yellow-400/80 scale-[1.02] card-shadow'
         : 'bg-white/8 hover:bg-white/15 border border-white/10',
       bird.isDead ? 'opacity-70 bg-red-900/20' : '',
+      isExploring ? 'ring-1 ring-cyan-400/50' : '',
     ]"
     @click="emit('select')"
   >
@@ -48,7 +63,7 @@ const hatchProgress = computed(() => {
         <BirdSprite
           :stage="bird.stage"
           :is-dead="bird.isDead"
-          :is-away="bird.isAway"
+          :is-away="bird.isAway || isExploring"
           :is-sick="bird.isSick"
           :just-hatched="bird.justHatched"
           :just-grew="bird.justGrew"
@@ -137,8 +152,33 @@ const hatchProgress = computed(() => {
           </button>
         </div>
 
-        <div v-if="bird.isAway && !bird.isDead" class="text-center text-blue-300 text-xs py-2">
+        <div v-if="isExploring" class="mt-2" @click.stop>
+          <ExpeditionPanel
+            :bird="bird"
+            :weather="weather"
+            :can-expedition="canExpedition"
+            @start="(area) => emit('startExpedition', area)"
+          />
+        </div>
+
+        <div
+          v-else-if="bird.stage === 'subadult' || bird.stage === 'adult'"
+          class="mt-2"
+          @click.stop
+        >
+          <ExpeditionPanel
+            :bird="bird"
+            :weather="weather"
+            :can-expedition="canExpedition"
+            @start="(area) => emit('startExpedition', area)"
+          />
+        </div>
+
+        <div v-if="bird.isAway && !bird.isDead && !isExploring" class="text-center text-blue-300 text-xs py-2">
           💨 暂时离巢中，天气好就回来~
+        </div>
+        <div v-if="isExploring && !bird.isDead" class="text-center text-cyan-300 text-xs py-1">
+          🗺️ 正在{{ exploringAreaName }}探险...
         </div>
         <div v-if="bird.isSick && !bird.isDead" class="text-center text-orange-300 text-xs py-1">
           🤒 生病了，注意健康和保暖！

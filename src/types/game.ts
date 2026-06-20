@@ -8,6 +8,54 @@ export type BerryType = 'red' | 'blue' | 'golden'
 
 export type GamePhase = 'start' | 'playing' | 'breeding' | 'ended'
 
+export type ExpeditionArea = 'forest' | 'meadow' | 'riverside' | 'mountain'
+
+export type ExpeditionStatus = 'idle' | 'exploring' | 'returning'
+
+export type ExpeditionEventType = 'find' | 'clue' | 'danger' | 'encounter' | 'weather'
+
+export interface ExpeditionEvent {
+  id: string
+  type: ExpeditionEventType
+  title: string
+  description: string
+  emoji: string
+  hungerDelta: number
+  fearDelta: number
+  healthDelta: number
+  foodReward: number
+  clueReward?: string
+  weight: number
+}
+
+export interface ExpeditionState {
+  status: ExpeditionStatus
+  area: ExpeditionArea
+  startTime: number
+  duration: number
+  returnTime: number
+  progress: number
+  currentEvent?: ExpeditionEvent
+  history: ExpeditionRecord[]
+}
+
+export interface ExpeditionRecord {
+  id: string
+  birdId: string
+  birdName: string
+  area: ExpeditionArea
+  startTime: number
+  endTime: number
+  duration: number
+  events: ExpeditionEvent[]
+  totalFoodGained: number
+  totalCluesFound: string[]
+  hungerDelta: number
+  fearDelta: number
+  healthDelta: number
+  success: boolean
+}
+
 export interface Bird {
   id: string
   name: string
@@ -29,6 +77,7 @@ export interface Bird {
   justHatched?: boolean
   justGrew?: boolean
   justFed?: boolean
+  expedition?: ExpeditionState
 }
 
 export interface Berry {
@@ -54,6 +103,8 @@ export interface GameState {
   breedingCount: number
   maxBreedingRounds: number
   eventLog: { id: string; message: string; type: string; timestamp: number }[]
+  expeditionRecords: ExpeditionRecord[]
+  collectedClues: string[]
   score?: GameScore
   selectedBirdId?: string
 }

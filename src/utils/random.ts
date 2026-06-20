@@ -22,6 +22,16 @@ export const chance = (probability: number): boolean => {
   return Math.random() < probability
 }
 
+export const weightedChoice = <T extends { weight: number }>(items: T[]): T => {
+  const totalWeight = items.reduce((sum, item) => sum + item.weight, 0)
+  let random = Math.random() * totalWeight
+  for (const item of items) {
+    random -= item.weight
+    if (random <= 0) return item
+  }
+  return items[items.length - 1]
+}
+
 export const lerp = (a: number, b: number, t: number): number => {
   return a + (b - a) * t
 }
